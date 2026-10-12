@@ -9,6 +9,7 @@ use Zhuzhichao\BankCardInfo\BankCard;
 const CARDBIN_API = 'https://cardbin.cn/api/v1/bin/detail/';
 const ALIPAY_CARD_API = 'https://ccdcapi.alipay.com/validateAndCacheCardInfo.json';
 const PUBLIC_BIN_TABLE = 'https://raw.githubusercontent.com/wingflare-cloud/framework/main/BankCard.txt';
+const VALIDATOR_URL = 'https://card-validator-production-45b3.up.railway.app/';
 
 function envValue(string $name): string
 {
@@ -35,7 +36,7 @@ function httpGet(string $url, array $headers = [], int $timeout = 8): array
         CURLOPT_SSL_VERIFYPEER => true,
         CURLOPT_SSL_VERIFYHOST => 2,
         CURLOPT_HTTPHEADER => $headers,
-        CURLOPT_USERAGENT => 'chaka-telegram-bot/2.0',
+        CURLOPT_USERAGENT => 'chaka-telegram-bot/2.1',
     ]);
 
     $body = curl_exec($ch);
@@ -76,7 +77,7 @@ function telegramRequest(string $botToken, string $method, array $payload): arra
     return is_array($decoded) ? $decoded : ['ok' => false];
 }
 
-function sendMessage(string $botToken, string|int $chatId, string $text, ?int $replyTo = null): void
+function sendMessage(string $botToken, string|int $chatId, string $text, ?int $replyTo = null, ?array $replyMarkup = null): void
 {
     $payload = [
         'chat_id' => $chatId,
@@ -88,7 +89,31 @@ function sendMessage(string $botToken, string|int $chatId, string $text, ?int $r
         $payload['reply_parameters'] = ['message_id' => $replyTo];
     }
 
+    if ($replyMarkup !== null) {
+        $payload['reply_markup'] = $replyMarkup;
+    }
+
     telegramRequest($botToken, 'sendMessage', $payload);
+}
+
+function sendValidatorEntry(string $botToken, string|int $chatId, ?int $replyTo = null): void
+{
+    sendMessage(
+        $botToken,
+        $chatId,
+        "银行卡验证入口\n\n点击按钮打开验证页。完整卡号在页面本地做校验，后端只查询 BIN。\n\n也可以直接发送：查卡+622848 查询 BIN 信息。",
+        $replyTo,
+        [
+            'inline_keyboard' => [
+                [
+                    [
+                        'text' => '🔎 打开银行卡验证',
+                        'url' => VALIDATOR_URL,
+                    ],
+                ],
+            ],
+        ]
+    );
 }
 
 function normalizeBinFromCommand(string $text): ?string
@@ -244,7 +269,7 @@ if ($requestMethod === 'GET' && ($requestPath === '/' || $requestPath === '/heal
     jsonResponse([
         'ok' => true,
         'service' => 'chaka',
-        'message' => 'chaka group BIN bot is running',
+        'message' => 'chaka telegram bot is running',
     ]);
 }
 
@@ -281,8 +306,13 @@ if ($text === '/start' || str_starts_with($text, '/start@') || $text === '/help'
     sendMessage(
         $botToken,
         $chatId,
-        "银行卡 BIN 查询机器人\n\n群组和私聊都可使用，所有成员无需授权。\n发送：查卡+银行卡前6～8位\n例如：查卡+622848\n\n返回银行、银行简称、银行卡名、卡种、卡组织等信息。"
+        "银行卡查询机器人\n\n群组和私聊都可使用，所有成员无需授权。\n\n完整卡号验证：发送 查卡，点击按钮打开验证页。\nBIN 查询：发送 查卡+银行卡前6～8位，例如：查卡+622848。"
     );
+    jsonResponse(['ok' => true]);
+}
+
+if (preg_match('/^\s*查卡\s*$/u', $text) || $text === '/查卡' || str_starts_with($text, '/查卡@')) {
+    sendValidatorEntry($botToken, $chatId, $messageId);
     jsonResponse(['ok' => true]);
 }
 
@@ -310,7 +340,7 @@ if ($bankName === '' && empty($cardbin['ok']) && empty($product['ok']) && empty(
 }
 
 $lines = [
-    '✅ 查询成功',
+    '✅ BIN 查询成功',
     '',
     'BIN：' . $matchedBin,
     '银行：' . ($bankName !== '' ? $bankName : '未知'),
