@@ -1,0 +1,14 @@
+{
+  "name": "liang17818/chaka",
+  "description": "Telegram bank card BIN lookup bot",
+  "type": "project",
+  "require": {
+    "php": "^8.2 || ^8.3",
+    "ext-curl": "*",
+    "zhuzhichao/bank-card-info": "^2.1"
+  },
+  "config": {
+    "optimize-autoloader": true,
+    "sort-packages": true
+  }
+}
