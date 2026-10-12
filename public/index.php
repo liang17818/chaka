@@ -6,7 +6,9 @@ require dirname(__DIR__) . '/vendor/autoload.php';
 
 use Zhuzhichao\BankCardInfo\BankCard;
 
+const CARDBIN_API = 'https://cardbin.cn/api/v1/bin/detail/';
 const ALIPAY_CARD_API = 'https://ccdcapi.alipay.com/validateAndCacheCardInfo.json';
+const PUBLIC_BIN_TABLE = 'https://raw.githubusercontent.com/wingflare-cloud/framework/main/BankCard.txt';
 
 function envValue(string $name): string
 {
@@ -20,6 +22,32 @@ function jsonResponse(array $payload, int $status = 200): never
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
+}
+
+function httpGet(string $url, array $headers = [], int $timeout = 8): array
+{
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 4,
+        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_USERAGENT => 'chaka-telegram-bot/2.0',
+    ]);
+
+    $body = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_errno($ch);
+    curl_close($ch);
+
+    return [
+        'ok' => $body !== false && $error === 0 && $status >= 200 && $status < 300,
+        'status' => $status,
+        'body' => is_string($body) ? $body : '',
+    ];
 }
 
 function telegramRequest(string $botToken, string $method, array $payload): array
@@ -48,91 +76,167 @@ function telegramRequest(string $botToken, string $method, array $payload): arra
     return is_array($decoded) ? $decoded : ['ok' => false];
 }
 
-function sendMessage(string $botToken, string|int $chatId, string $text): void
+function sendMessage(string $botToken, string|int $chatId, string $text, ?int $replyTo = null): void
 {
-    telegramRequest($botToken, 'sendMessage', [
+    $payload = [
         'chat_id' => $chatId,
         'text' => $text,
         'disable_web_page_preview' => true,
-    ]);
-}
+    ];
 
-function parseAllowedUsers(string $raw): array
-{
-    if ($raw === '') {
-        return [];
+    if ($replyTo !== null) {
+        $payload['reply_parameters'] = ['message_id' => $replyTo];
     }
 
-    $items = array_filter(
-        array_map('trim', explode(',', $raw)),
-        static fn(string $item): bool => $item !== ''
-    );
-
-    return array_values(array_unique($items));
+    telegramRequest($botToken, 'sendMessage', $payload);
 }
 
-function normalizeBin(string $input): ?string
+function normalizeBinFromCommand(string $text): ?string
 {
-    $candidate = preg_replace('/\s+/u', '', trim($input));
-    if (!is_string($candidate) || !preg_match('/^\d{6,8}$/', $candidate)) {
+    if (!preg_match('/^\s*查卡\s*[+＋:：]?\s*(\d{6,8})\s*$/u', $text, $matches)) {
         return null;
     }
 
-    return $candidate;
+    return $matches[1];
 }
 
-function lookupBin(string $bin): array
+function lookupCardBinCn(string $bin, string $token): array
 {
-    // 仅使用用户提供的 BIN 构造一个虚拟卡号用于 BIN 识别。
-    // 不接收、保存或向第三方发送用户的完整银行卡号。
-    $syntheticCardNumber = str_pad($bin, 16, '0');
+    if ($token === '') {
+        return ['ok' => false];
+    }
 
+    $response = httpGet(
+        CARDBIN_API . rawurlencode($bin),
+        ['Accept: application/json', 'X-API-Token: ' . $token]
+    );
+
+    if (!$response['ok']) {
+        return ['ok' => false];
+    }
+
+    $data = json_decode($response['body'], true);
+    if (!is_array($data) || (int)($data['code'] ?? -1) !== 0 || !is_array($data['data'] ?? null)) {
+        return ['ok' => false];
+    }
+
+    $item = $data['data'];
+    $issuer = is_array($item['issuer'] ?? null) ? $item['issuer'] : [];
+    $country = is_array($item['country'] ?? null) ? $item['country'] : [];
+
+    return [
+        'ok' => true,
+        'bin' => (string)($item['bin'] ?? $bin),
+        'bankName' => (string)($issuer['name_zh'] ?? $issuer['name'] ?? ''),
+        'typeName' => (string)($item['type_zh'] ?? $item['type'] ?? ''),
+        'scheme' => (string)($item['brand_zh'] ?? $item['scheme'] ?? ''),
+        'category' => (string)($item['category_zh'] ?? $item['category'] ?? ''),
+        'country' => (string)($country['name_zh'] ?? $country['name'] ?? ''),
+    ];
+}
+
+function lookupPublicBinTable(string $bin): array
+{
+    $response = httpGet(PUBLIC_BIN_TABLE, ['Accept: text/plain'], 7);
+    if (!$response['ok'] || $response['body'] === '') {
+        return ['ok' => false];
+    }
+
+    $body = $response['body'];
+    $max = min(8, strlen($bin));
+
+    for ($length = $max; $length >= 5; $length--) {
+        $prefix = substr($bin, 0, $length);
+        $quoted = preg_quote($prefix, '/');
+        $patterns = [
+            '/[\'\"]' . $quoted . '[\'\"]\s*:\s*[\'\"]([^\'\"]+)[\'\"]/u',
+            '/[\'\"]?' . $quoted . '[\'\"]?\s*=>\s*[\'\"]([^\'\"]+)[\'\"]/u',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (!preg_match($pattern, $body, $match)) {
+                continue;
+            }
+
+            $parts = explode('-', trim($match[1]));
+            return [
+                'ok' => true,
+                'matchedBin' => $prefix,
+                'bankName' => trim($parts[0] ?? ''),
+                'cardName' => trim($parts[1] ?? ''),
+                'typeName' => trim($parts[2] ?? ''),
+            ];
+        }
+    }
+
+    return ['ok' => false];
+}
+
+function lookupAlipayFallback(string $bin): array
+{
+    $synthetic = str_pad($bin, 16, '0');
     $url = ALIPAY_CARD_API . '?' . http_build_query([
         '_input_charset' => 'utf-8',
-        'cardNo' => $syntheticCardNumber,
+        'cardNo' => $synthetic,
         'cardBinCheck' => 'true',
     ]);
 
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_TIMEOUT => 10,
-        CURLOPT_FOLLOWLOCATION => false,
-        CURLOPT_HTTPHEADER => ['Accept: application/json'],
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_USERAGENT => 'chaka-telegram-bot/1.0',
-    ]);
-
-    $body = curl_exec($ch);
-    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_errno($ch);
-    curl_close($ch);
-
-    if ($body === false || $curlError !== 0 || $status < 200 || $status >= 300) {
-        return ['ok' => false, 'reason' => 'upstream_error'];
+    $response = httpGet($url, ['Accept: application/json']);
+    if (!$response['ok']) {
+        return ['ok' => false];
     }
 
-    $data = json_decode((string)$body, true);
-    if (!is_array($data)) {
-        return ['ok' => false, 'reason' => 'invalid_response'];
-    }
-
-    if (empty($data['validated'])) {
-        return ['ok' => false, 'reason' => 'not_found'];
+    $data = json_decode($response['body'], true);
+    if (!is_array($data) || empty($data['validated'])) {
+        return ['ok' => false];
     }
 
     return [
         'ok' => true,
-        'bank' => (string)($data['bank'] ?? ''),
+        'bankCode' => (string)($data['bank'] ?? ''),
         'cardType' => (string)($data['cardType'] ?? ''),
     ];
 }
 
+function inferBankCode(string $bankName, array $alipay): string
+{
+    if (!empty($alipay['bankCode'])) {
+        return (string)$alipay['bankCode'];
+    }
+
+    if ($bankName === '') {
+        return '';
+    }
+
+    foreach (BankCard::getBankList() as $code => $name) {
+        if ($name === $bankName || str_contains($name, $bankName) || str_contains($bankName, $name)) {
+            return (string)$code;
+        }
+    }
+
+    return '';
+}
+
+function normalizeTypeName(string $value, array $alipay): string
+{
+    if ($value !== '') {
+        return match (strtoupper($value)) {
+            'DEBIT', 'DC' => '借记卡',
+            'CREDIT', 'CC' => '信用卡',
+            default => $value,
+        };
+    }
+
+    return match ((string)($alipay['cardType'] ?? '')) {
+        'DC' => '借记卡',
+        'CC' => '信用卡',
+        default => '未知',
+    };
+}
+
 $botToken = envValue('BOT_TOKEN');
 $webhookSecret = envValue('WEBHOOK_SECRET');
-$allowedUsers = parseAllowedUsers(envValue('ALLOWED_USER_IDS'));
+$cardbinToken = envValue('CARDBIN_TOKEN');
 $requestMethod = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
 $requestPath = parse_url((string)($_SERVER['REQUEST_URI'] ?? '/'), PHP_URL_PATH) ?: '/';
 
@@ -140,7 +244,7 @@ if ($requestMethod === 'GET' && ($requestPath === '/' || $requestPath === '/heal
     jsonResponse([
         'ok' => true,
         'service' => 'chaka',
-        'message' => 'chaka bot is running',
+        'message' => 'chaka group BIN bot is running',
     ]);
 }
 
@@ -159,99 +263,76 @@ if ($receivedSecret === '' || !hash_equals($webhookSecret, $receivedSecret)) {
 
 $rawBody = file_get_contents('php://input');
 $update = json_decode(is_string($rawBody) ? $rawBody : '', true);
+$message = is_array($update) ? ($update['message'] ?? null) : null;
 
-if (!is_array($update)) {
+if (!is_array($message) || !is_array($message['chat'] ?? null)) {
     jsonResponse(['ok' => true]);
 }
 
-$message = $update['message'] ?? null;
-if (!is_array($message)) {
-    jsonResponse(['ok' => true]);
-}
-
-$chat = $message['chat'] ?? null;
-$from = $message['from'] ?? null;
+$chatId = (string)($message['chat']['id'] ?? '');
 $text = trim((string)($message['text'] ?? ''));
+$messageId = isset($message['message_id']) ? (int)$message['message_id'] : null;
 
-if (!is_array($chat) || !isset($chat['id']) || !is_array($from) || !isset($from['id'])) {
+if ($chatId === '' || $text === '') {
     jsonResponse(['ok' => true]);
 }
 
-$chatId = (string)$chat['id'];
-$userId = (string)$from['id'];
-$chatType = (string)($chat['type'] ?? '');
-
-if ($chatType !== 'private') {
-    sendMessage($botToken, $chatId, '为保护支付信息，本机器人仅允许私聊使用。');
-    jsonResponse(['ok' => true]);
-}
-
-if ($text === '/id' || str_starts_with($text, '/id@')) {
-    sendMessage($botToken, $chatId, "你的 Telegram User ID：{$userId}");
-    jsonResponse(['ok' => true]);
-}
-
-if ($text === '/start' || str_starts_with($text, '/start@')) {
-    $authorization = in_array($userId, $allowedUsers, true) ? '已授权' : '未授权';
+if ($text === '/start' || str_starts_with($text, '/start@') || $text === '/help' || str_starts_with($text, '/help@')) {
     sendMessage(
         $botToken,
         $chatId,
-        "银行卡 BIN 查询机器人\n\n状态：{$authorization}\n你的 Telegram User ID：{$userId}\n\n请只发送银行卡前 6～8 位 BIN，例如：621483\n不要发送完整银行卡号。"
+        "银行卡 BIN 查询机器人\n\n群组和私聊都可使用，所有成员无需授权。\n发送：查卡+银行卡前6～8位\n例如：查卡+622848\n\n返回银行、银行简称、银行卡名、卡种、卡组织等信息。"
     );
     jsonResponse(['ok' => true]);
 }
 
-if ($text === '/help' || str_starts_with($text, '/help@')) {
-    sendMessage($botToken, $chatId, "使用方法：\n1. 私聊机器人\n2. 只发送银行卡前 6～8 位数字\n3. 返回银行、银行代码和卡类型\n\n命令：/start /id /help\n\n为保护支付信息，机器人不会处理完整银行卡号。 ");
-    jsonResponse(['ok' => true]);
-}
-
-if (!in_array($userId, $allowedUsers, true)) {
-    sendMessage($botToken, $chatId, "⛔ 当前账号未授权。\n\n你的 Telegram User ID：{$userId}\n请把这个 ID 加入 Railway 的 ALLOWED_USER_IDS。 ");
-    jsonResponse(['ok' => true]);
-}
-
-if (preg_match('/^\d{12,19}$/', preg_replace('/\s+/u', '', $text) ?? '')) {
-    sendMessage($botToken, $chatId, '⚠️ 请不要发送完整银行卡号。只发送前 6～8 位 BIN，例如：621483。');
-    jsonResponse(['ok' => true]);
-}
-
-$bin = normalizeBin($text);
+$bin = normalizeBinFromCommand($text);
 if ($bin === null) {
-    sendMessage($botToken, $chatId, '格式错误。请只发送银行卡前 6～8 位数字，例如：621483。');
     jsonResponse(['ok' => true]);
 }
 
-$result = lookupBin($bin);
-if (empty($result['ok'])) {
-    $reason = (string)($result['reason'] ?? 'unknown');
-    $messageText = match ($reason) {
-        'not_found' => '❌ 暂未识别到这个 BIN 的银行信息。',
-        'upstream_error' => '⚠️ 查询接口暂时不可用，请稍后重试。',
-        default => '⚠️ 查询返回异常，请稍后重试。',
-    };
+$cardbin = lookupCardBinCn($bin, $cardbinToken);
+$product = lookupPublicBinTable($bin);
+$alipay = lookupAlipayFallback($bin);
 
-    sendMessage($botToken, $chatId, $messageText);
+$bankName = (string)($product['bankName'] ?? $cardbin['bankName'] ?? '');
+$cardName = (string)($product['cardName'] ?? '');
+$typeName = normalizeTypeName((string)($product['typeName'] ?? $cardbin['typeName'] ?? ''), $alipay);
+$bankCode = inferBankCode($bankName, $alipay);
+$scheme = (string)($cardbin['scheme'] ?? '');
+$category = (string)($cardbin['category'] ?? '');
+$country = (string)($cardbin['country'] ?? '');
+$matchedBin = (string)($product['matchedBin'] ?? $cardbin['bin'] ?? $bin);
+
+if ($bankName === '' && empty($cardbin['ok']) && empty($product['ok']) && empty($alipay['ok'])) {
+    sendMessage($botToken, $chatId, "❌ 暂未查到 BIN：{$bin} 的银行卡信息。", $messageId);
     jsonResponse(['ok' => true]);
 }
 
-$bankCode = (string)($result['bank'] ?? '');
-$cardType = (string)($result['cardType'] ?? '');
-$bankList = BankCard::getBankList();
-$bankName = $bankList[$bankCode] ?? ($bankCode !== '' ? $bankCode : '未知银行');
-$typeName = match ($cardType) {
-    'DC' => '储蓄卡',
-    'CC' => '信用卡',
-    default => '未知',
-};
+$lines = [
+    '✅ 查询成功',
+    '',
+    'BIN：' . $matchedBin,
+    '银行：' . ($bankName !== '' ? $bankName : '未知'),
+    '银行简称：' . ($bankCode !== '' ? $bankCode : '未知'),
+    '银行卡名：' . ($cardName !== '' ? $cardName : '未知'),
+    '银行卡种：' . $typeName,
+];
 
-$responseText = "✅ BIN 查询成功\n\n"
-    . "🔢 BIN：{$bin}\n"
-    . "🏦 银行：{$bankName}\n"
-    . "🏷 银行代码：" . ($bankCode !== '' ? $bankCode : '未知') . "\n"
-    . "💳 卡类型：{$typeName}\n"
-    . "🔖 类型代码：" . ($cardType !== '' ? $cardType : '未知') . "\n\n"
-    . '提示：BIN 查询结果仅用于识别发卡机构和卡类型，不代表具体账户真实存在或有效。';
+if ($scheme !== '') {
+    $lines[] = '卡组织：' . $scheme;
+}
+if ($category !== '') {
+    $lines[] = '卡等级：' . $category;
+}
+if ($country !== '') {
+    $lines[] = '国家/地区：' . $country;
+}
 
-sendMessage($botToken, $chatId, $responseText);
+$lines[] = '省份：暂无可靠免注册数据';
+$lines[] = '城市：暂无可靠免注册数据';
+$lines[] = '';
+$lines[] = '说明：结果用于 BIN / 发卡机构识别，不代表具体账户真实存在或可交易。';
+
+sendMessage($botToken, $chatId, implode("\n", $lines), $messageId);
 jsonResponse(['ok' => true]);
