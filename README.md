@@ -6,12 +6,12 @@ Telegram 银行卡 BIN / 发卡行查询机器人。
 
 ## 功能
 
-- Telegram 私聊发送银行卡号后查询发卡银行和卡类型
+- Telegram 私聊发送银行卡前 6～8 位 BIN 后查询发卡银行和卡类型
+- 明确拒绝处理完整银行卡号
 - 支持 `/start`、`/id`、`/help`
 - `ALLOWED_USER_IDS` 白名单限制访问
 - Webhook Secret 校验
-- 返回结果自动脱敏（前 6 位 + 后 4 位）
-- 不保存银行卡号，不主动记录完整卡号
+- 不保存银行卡号，不主动记录支付信息
 - Docker / Railway 部署
 
 ## Railway 部署
@@ -34,7 +34,7 @@ chaka_K9p3xQ2m7N5v
 ```
 
 5. 在 Railway 项目 **Settings / Networking** 中生成公开域名。
-6. 浏览器打开部署后的域名，若显示 `chaka bot is running`，说明服务正常。
+6. 浏览器打开部署后的域名。若看到 JSON 中 `"message":"chaka bot is running"`，说明服务正常。
 7. 设置 Telegram Webhook：
 
 ```bash
@@ -63,7 +63,11 @@ ALLOWED_USER_IDS=123456789
 ALLOWED_USER_IDS=123456789,987654321
 ```
 
-10. Railway 会自动重新部署。之后发送银行卡号即可查询。
+10. Railway 会自动重新部署。之后只发送银行卡前 6～8 位即可查询，例如：
+
+```text
+621483
+```
 
 ## 环境变量
 
@@ -74,10 +78,14 @@ ALLOWED_USER_IDS=123456789,987654321
 | `ALLOWED_USER_IDS` | 是 | 允许使用机器人的 Telegram User ID，逗号分隔 |
 | `PORT` | 否 | Railway 自动提供，本地默认 8080 |
 
+## 查询原理
+
+机器人只接收 6～8 位 BIN。为了兼容 BIN 识别接口，服务器会根据这个 BIN 构造一个虚拟号码用于识别银行与卡类型；不会接收或转发用户真实的完整银行卡号。
+
+银行代码到中文名称的映射来自 `zhuzhichao/bank-card-info`。
+
 ## 安全说明
 
-完整银行卡号属于敏感支付数据。本项目不会主动写数据库，也不会主动将完整卡号打印到应用日志；查询结果只显示脱敏卡号。
-
-当前查询方式会把银行卡号提交给用于 BIN 识别的第三方接口。若只需要识别银行/BIN，建议后续改为本地 BIN 数据库，并只发送前 6～8 位数字，以减少完整卡号的传输范围。
+完整银行卡号属于敏感支付数据，因此本机器人不会处理完整银行卡号。请只发送前 6～8 位 BIN。
 
 不要把 `BOT_TOKEN`、`WEBHOOK_SECRET` 或任何真实银行卡号提交到 GitHub。
